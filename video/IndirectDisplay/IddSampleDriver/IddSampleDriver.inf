@@ -64,7 +64,7 @@ IddSampleDriver.dll
 ; =================== Generic ==================================
 
 [Strings]
-ManufacturerName="<Your manufacturer name>" ; TODO: Replace with your manufacturer name
+ManufacturerName="Chesya" ; TODO: Replace with your manufacturer name
 DiskName = "IddSampleDriver Installation Disk" ; TODO: Replace with driver disk name
 DeviceName="IddSampleDriver Device" ; TODO: Replace with correct device name
 
