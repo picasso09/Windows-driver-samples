@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "Trace.h"
+#include "IddBrightnessShared.h"
 
 namespace Microsoft
 {
@@ -117,6 +118,6 @@ namespace Microsoft
         private:
             IDDCX_MONITOR m_Monitor;
             std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
-        } ;
+        };
     }
 }

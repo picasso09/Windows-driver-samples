@@ -18,13 +18,18 @@ Environment:
 #include "Driver.h"
 #include "Driver.tmh"
 
+#include <strsafe.h>
+
 using namespace std;
 using namespace Microsoft::IndirectDisp;
 using namespace Microsoft::WRL;
 
+// Jumlah panggilan SetGammaRamp dari OS (dipakai untuk probe lewat IOCTL_IDD_GET_GAMMA_CALLS)
+static volatile LONG g_GammaCallCount = 0;
+
 #pragma region SampleMonitors
 
-static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 3; // If monitor count > ARRAYSIZE(s_SampleMonitors), we create edid-less monitors
+static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1; // If monitor count > ARRAYSIZE(s_SampleMonitors), we create edid-less monitors
 
 // Default modes reported for edid-less monitors. The first mode is set as preferred
 static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] = 
@@ -136,6 +141,14 @@ EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES IddSampleMonitorQueryModes;
 EVT_IDD_CX_MONITOR_ASSIGN_SWAPCHAIN IddSampleMonitorAssignSwapChain;
 EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN IddSampleMonitorUnassignSwapChain;
 
+// Nama pertama dikonfirmasi dokumentasi Microsoft; nama kedua belum.
+// Kalau compiler protes soal tipe (C2146), ganti dengan prototipe eksplisit di bawah ini dan
+// hapus _Use_decl_annotations_ pada definisinya:
+//   NTSTATUS IddSampleMonitorSetGammaRamp(IDDCX_MONITOR MonitorObject, const IDARG_IN_SET_GAMMARAMP* pInArgs);
+//   VOID IddSampleIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request, size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode);
+EVT_IDD_CX_MONITOR_SET_GAMMA_RAMP IddSampleMonitorSetGammaRamp;
+EVT_IDD_CX_DEVICE_IO_CONTROL IddSampleIoDeviceControl;
+
 struct IndirectDeviceContextWrapper
 {
     IndirectDeviceContext* pContext;
@@ -216,10 +229,6 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     IDD_CX_CLIENT_CONFIG IddConfig;
     IDD_CX_CLIENT_CONFIG_INIT(&IddConfig);
 
-    // If the driver wishes to handle custom IoDeviceControl requests, it's necessary to use this callback since IddCx
-    // redirects IoDeviceControl requests to an internal queue. This sample does not need this.
-    // IddConfig.EvtIddCxDeviceIoControl = IddSampleIoDeviceControl;
-
     IddConfig.EvtIddCxAdapterInitFinished = IddSampleAdapterInitFinished;
 
     IddConfig.EvtIddCxParseMonitorDescription = IddSampleParseMonitorDescription;
@@ -228,6 +237,10 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     IddConfig.EvtIddCxAdapterCommitModes = IddSampleAdapterCommitModes;
     IddConfig.EvtIddCxMonitorAssignSwapChain = IddSampleMonitorAssignSwapChain;
     IddConfig.EvtIddCxMonitorUnassignSwapChain = IddSampleMonitorUnassignSwapChain;
+
+    // Probe kecerahan: callback gamma + IOCTL untuk service
+    IddConfig.EvtIddCxMonitorSetGammaRamp = IddSampleMonitorSetGammaRamp;
+    IddConfig.EvtIddCxDeviceIoControl = IddSampleIoDeviceControl;
 
     Status = IddCxDeviceInitConfig(pDeviceInit, &IddConfig);
     if (!NT_SUCCESS(Status))
@@ -252,6 +265,13 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     if (!NT_SUCCESS(Status))
     {
         return Status;
+    }
+
+    // Device interface supaya service user-mode bisa membuka driver. Tidak fatal kalau gagal.
+    NTSTATUS IfStatus = WdfDeviceCreateDeviceInterface(Device, &GUID_DEVINTERFACE_IDD_BRIGHTNESS, nullptr);
+    if (!NT_SUCCESS(IfStatus))
+    {
+        OutputDebugStringA("IddBrightness: WdfDeviceCreateDeviceInterface gagal\n");
     }
 
     Status = IddCxDeviceInitialize(Device);
@@ -497,7 +517,7 @@ void IndirectDeviceContext::InitAdapter()
     // Declare basic feature support for the adapter (required)
     AdapterCaps.MaxMonitorsSupported = IDD_SAMPLE_MONITOR_COUNT;
     AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
-    AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
+    AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE;
     AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
 
     // Declare your device strings for telemetry (required)
@@ -552,7 +572,8 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     // In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
     IDDCX_MONITOR_INFO MonitorInfo = {};
     MonitorInfo.Size = sizeof(MonitorInfo);
-    MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+    // Tipe konektor "embedded" (dianggap panel internal) untuk eksperimen slider kecerahan
+    MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
     MonitorInfo.ConnectorIndex = ConnectorIndex;
 
     MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
@@ -804,6 +825,62 @@ NTSTATUS IddSampleMonitorUnassignSwapChain(IDDCX_MONITOR MonitorObject)
     auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
     pMonitorContextWrapper->pContext->UnassignSwapChain();
     return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+NTSTATUS IddSampleMonitorSetGammaRamp(IDDCX_MONITOR MonitorObject, const IDARG_IN_SET_GAMMARAMP* pInArgs)
+{
+    UNREFERENCED_PARAMETER(MonitorObject);
+    UNREFERENCED_PARAMETER(pInArgs);
+
+    LONG n = InterlockedIncrement(&g_GammaCallCount);
+
+    char buf[64];
+    StringCchPrintfA(buf, ARRAYSIZE(buf), "IddBrightness: SetGammaRamp dipanggil #%ld\n", n);
+    OutputDebugStringA(buf);
+
+    // TODO (setelah nama member struct terverifikasi dari iddcx.h): baca data ramp dan hitung persen kecerahan di sini.
+    return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+VOID IddSampleIoDeviceControl(
+    WDFDEVICE Device,
+    WDFREQUEST Request,
+    size_t OutputBufferLength,
+    size_t InputBufferLength,
+    ULONG IoControlCode)
+{
+    UNREFERENCED_PARAMETER(Device);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    switch (IoControlCode)
+    {
+    case IOCTL_IDD_GET_GAMMA_CALLS:
+    {
+        if (OutputBufferLength < sizeof(DWORD))
+        {
+            WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
+            return;
+        }
+
+        DWORD* pOut = nullptr;
+        NTSTATUS Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(DWORD), reinterpret_cast<PVOID*>(&pOut), nullptr);
+        if (NT_SUCCESS(Status))
+        {
+            *pOut = static_cast<DWORD>(g_GammaCallCount);
+            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(DWORD));
+        }
+        else
+        {
+            WdfRequestComplete(Request, Status);
+        }
+        return;
+    }
+    default:
+        WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
+        return;
+    }
 }
 
 #pragma endregion
