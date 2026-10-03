@@ -1,0 +1,46 @@
+name: Build IddSampleDriver (WDK)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile WDK Driver (x64)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install WDK via Chocolatey
+        shell: cmd
+        run: |
+          choco install windowsdriverkit10 -y --no-progress
+
+      - name: Build Driver Solution
+        shell: cmd
+        run: |
+          msbuild video\IndirectDisplay\IddSampleDriver.sln ^
+            /p:Configuration=Debug ^
+            /p:Platform=x64 ^
+            /p:TargetPlatformVersion=10.0.26100.0 ^
+            /p:WindowsTargetPlatformVersion=10.0.26100.0 ^
+            /p:EnableInf2Cat=false ^
+            /p:InfVerif_Enabled=false ^
+            /m
+
+      - name: Upload Driver Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDD-Driver-x64-Debug
+          path: |
+            video/IndirectDisplay/x64/Debug/IddSampleDriver/
+            video/IndirectDisplay/x64/Debug/Package/
+          if-no-files-found: error
